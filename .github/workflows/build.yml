@@ -24,7 +24,8 @@ jobs:
 
       - name: Generate project files
         run: |
-          mkdir -p app/src/main/java/com/example/volwake app/src/main/res/xml app/src/main/res/values
+          rm -rf app
+          mkdir -p app/src/main/java/com/example/volwake app/src/main/res/values
 
           cat > settings.gradle.kts <<'EOF'
           pluginManagement {
@@ -66,10 +67,10 @@ jobs:
               compileSdk = 34
               defaultConfig {
                   applicationId = "com.example.volwake"
-                  minSdk = 24
+                  minSdk = 26
                   targetSdk = 34
                   versionCode = 1
-                  versionName = "1.0"
+                  versionName = "2.0"
               }
               compileOptions {
                   sourceCompatibility = JavaVersion.VERSION_17
@@ -85,7 +86,9 @@ jobs:
           <?xml version="1.0" encoding="utf-8"?>
           <manifest xmlns:android="http://schemas.android.com/apk/res/android">
               <uses-permission android:name="android.permission.WAKE_LOCK" />
-              <uses-permission android:name="android.permission.VIBRATE" />
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PLAYBACK" />
+              <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
               <application android:label="@string/app_name">
                   <activity android:name=".MainActivity" android:exported="true">
                       <intent-filter>
@@ -94,16 +97,9 @@ jobs:
                       </intent-filter>
                   </activity>
                   <service
-                      android:name=".WakeService"
-                      android:exported="true"
-                      android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE">
-                      <intent-filter>
-                          <action android:name="android.accessibilityservice.AccessibilityService" />
-                      </intent-filter>
-                      <meta-data
-                          android:name="android.accessibilityservice"
-                          android:resource="@xml/accessibility_service_config" />
-                  </service>
+                      android:name=".VolService"
+                      android:exported="false"
+                      android:foregroundServiceType="mediaPlayback" />
               </application>
           </manifest>
           EOF
@@ -111,73 +107,174 @@ jobs:
           cat > app/src/main/res/values/strings.xml <<'EOF'
           <resources>
               <string name="app_name">Volume Wake</string>
-              <string name="service_desc">Turns the screen on when you press Volume Down.</string>
           </resources>
-          EOF
-
-          cat > app/src/main/res/xml/accessibility_service_config.xml <<'EOF'
-          <?xml version="1.0" encoding="utf-8"?>
-          <accessibility-service xmlns:android="http://schemas.android.com/apk/res/android"
-              android:accessibilityEventTypes="typeWindowStateChanged"
-              android:accessibilityFeedbackType="feedbackGeneric"
-              android:accessibilityFlags="flagRequestFilterKeyEvents"
-              android:canRequestFilterKeyEvents="true"
-              android:description="@string/service_desc" />
           EOF
 
           cat > app/src/main/java/com/example/volwake/MainActivity.kt <<'EOF'
           package com.example.volwake
 
+          import android.Manifest
           import android.app.Activity
           import android.content.Intent
+          import android.os.Build
           import android.os.Bundle
-          import android.provider.Settings
+          import android.widget.TextView
 
           class MainActivity : Activity() {
               override fun onCreate(savedInstanceState: Bundle?) {
                   super.onCreate(savedInstanceState)
-                  startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS))
-                  finish()
+                  if (Build.VERSION.SDK_INT >= 33) {
+                      requestPermissions(arrayOf(Manifest.permission.POST_NOTIFICATIONS), 1)
+                  }
+                  startForegroundService(Intent(this, VolService::class.java))
+                  val tv = TextView(this)
+                  tv.text = "Volume Wake is running.\nTurn the screen off and press Volume Down.\nYou can close this app."
+                  tv.textSize = 18f
+                  tv.setPadding(48, 96, 48, 48)
+                  setContentView(tv)
               }
           }
           EOF
 
-          cat > app/src/main/java/com/example/volwake/WakeService.kt <<'EOF'
+          cat > app/src/main/java/com/example/volwake/VolService.kt <<'EOF'
           package com.example.volwake
 
-          import android.accessibilityservice.AccessibilityService
+          import android.app.Notification
+          import android.app.NotificationChannel
+          import android.app.NotificationManager
+          import android.app.Service
+          import android.content.BroadcastReceiver
+          import android.content.Context
+          import android.content.Intent
+          import android.content.IntentFilter
+          import android.content.pm.ServiceInfo
+          import android.media.AudioAttributes
+          import android.media.AudioFormat
+          import android.media.AudioManager
+          import android.media.AudioTrack
+          import android.media.VolumeProvider
+          import android.media.session.MediaSession
+          import android.media.session.PlaybackState
+          import android.os.Build
+          import android.os.IBinder
           import android.os.PowerManager
-          import android.os.VibrationEffect
-          import android.os.Vibrator
-          import android.view.KeyEvent
-          import android.view.accessibility.AccessibilityEvent
 
-          class WakeService : AccessibilityService() {
+          class VolService : Service() {
 
-              @Suppress("DEPRECATION")
-              private fun buzz() {
-                  val v = getSystemService(VIBRATOR_SERVICE) as Vibrator
-                  v.vibrate(VibrationEffect.createOneShot(200, VibrationEffect.DEFAULT_AMPLITUDE))
-              }
+              private lateinit var session: MediaSession
+              private var track: AudioTrack? = null
 
-              override fun onKeyEvent(event: KeyEvent): Boolean {
-                  if (event.keyCode == KeyEvent.KEYCODE_VOLUME_DOWN && event.action == KeyEvent.ACTION_DOWN) {
-                      buzz() // TEST: proves the phone delivered the button press
-                      val pm = getSystemService(POWER_SERVICE) as PowerManager
-                      if (!pm.isInteractive) {
-                          @Suppress("DEPRECATION")
-                          pm.newWakeLock(
-                              PowerManager.SCREEN_BRIGHT_WAKE_LOCK or PowerManager.ACQUIRE_CAUSES_WAKEUP,
-                              "volwake:wake"
-                          ).acquire(3000)
-                          return true
+              private val screenReceiver = object : BroadcastReceiver() {
+                  override fun onReceive(context: Context?, intent: Intent?) {
+                      when (intent?.action) {
+                          Intent.ACTION_SCREEN_OFF -> activate()
+                          Intent.ACTION_SCREEN_ON -> deactivate()
                       }
                   }
-                  return false
               }
 
-              override fun onAccessibilityEvent(event: AccessibilityEvent?) {}
-              override fun onInterrupt() {}
+              override fun onCreate() {
+                  super.onCreate()
+
+                  val nm = getSystemService(NotificationManager::class.java)
+                  nm.createNotificationChannel(
+                      NotificationChannel("vw", "Volume Wake", NotificationManager.IMPORTANCE_LOW)
+                  )
+                  val n = Notification.Builder(this, "vw")
+                      .setContentTitle("Volume Wake is on")
+                      .setSmallIcon(android.R.drawable.ic_media_play)
+                      .build()
+                  if (Build.VERSION.SDK_INT >= 29) {
+                      startForeground(1, n, ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK)
+                  } else {
+                      startForeground(1, n)
+                  }
+
+                  session = MediaSession(this, "volwake")
+                  session.setPlaybackToRemote(object : VolumeProvider(VOLUME_CONTROL_RELATIVE, 100, 50) {
+                      override fun onAdjustVolume(direction: Int) {
+                          val pm = getSystemService(POWER_SERVICE) as PowerManager
+                          if (!pm.isInteractive) {
+                              if (direction < 0) wake()
+                          }
+                      }
+                  })
+
+                  registerReceiver(screenReceiver, IntentFilter().apply {
+                      addAction(Intent.ACTION_SCREEN_OFF)
+                      addAction(Intent.ACTION_SCREEN_ON)
+                  })
+
+                  val pm = getSystemService(POWER_SERVICE) as PowerManager
+                  if (!pm.isInteractive) activate()
+              }
+
+              private fun wake() {
+                  val pm = getSystemService(POWER_SERVICE) as PowerManager
+                  @Suppress("DEPRECATION")
+                  pm.newWakeLock(
+                      PowerManager.SCREEN_BRIGHT_WAKE_LOCK or PowerManager.ACQUIRE_CAUSES_WAKEUP,
+                      "volwake:wake"
+                  ).acquire(3000)
+              }
+
+              private fun activate() {
+                  if (track != null) return
+                  val attrs = AudioAttributes.Builder()
+                      .setUsage(AudioAttributes.USAGE_MEDIA)
+                      .setContentType(AudioAttributes.CONTENT_TYPE_MUSIC)
+                      .build()
+                  val fmt = AudioFormat.Builder()
+                      .setSampleRate(44100)
+                      .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
+                      .setChannelMask(AudioFormat.CHANNEL_OUT_MONO)
+                      .build()
+                  val size = AudioTrack.getMinBufferSize(
+                      44100, AudioFormat.CHANNEL_OUT_MONO, AudioFormat.ENCODING_PCM_16BIT
+                  )
+                  val t = AudioTrack(attrs, fmt, size, AudioTrack.MODE_STREAM, AudioManager.AUDIO_SESSION_ID_GENERATE)
+                  t.play()
+                  track = t
+                  Thread {
+                      val buf = ShortArray(size / 2)
+                      try {
+                          while (track === t) {
+                              if (t.write(buf, 0, buf.size) < 0) break
+                          }
+                      } catch (e: Exception) {
+                      }
+                  }.start()
+
+                  session.setPlaybackState(
+                      PlaybackState.Builder()
+                          .setActions(PlaybackState.ACTION_PLAY or PlaybackState.ACTION_PAUSE)
+                          .setState(PlaybackState.STATE_PLAYING, 0, 1f)
+                          .build()
+                  )
+                  session.isActive = true
+              }
+
+              private fun deactivate() {
+                  session.isActive = false
+                  val t = track ?: return
+                  track = null
+                  try {
+                      t.stop()
+                      t.release()
+                  } catch (e: Exception) {
+                  }
+              }
+
+              override fun onStartCommand(intent: Intent?, flags: Int, startId: Int) = START_STICKY
+
+              override fun onBind(intent: Intent?): IBinder? = null
+
+              override fun onDestroy() {
+                  unregisterReceiver(screenReceiver)
+                  deactivate()
+                  session.release()
+                  super.onDestroy()
+              }
           }
           EOF
 
